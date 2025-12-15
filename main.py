@@ -374,10 +374,12 @@ class Main(Star):
             "items": [
                 {"cmd": "/宠物市场 [页码]", "desc": "查看群内宠物列表（支持分页）"},
                 {"cmd": "/购买宠物 @群友/QQ", "desc": "购买指定宠物"},
-                {"cmd": "/放生宠物 @群友/QQ", "desc": "放生宠物"},
-                {"cmd": "/打工", "desc": "派遣宠物打工赚钱"},
-                {"cmd": "/训练 @群友/QQ", "desc": "训练宠物提升身价（冷却1天）"},
-                {"cmd": "/进化宠物 @群友/QQ", "desc": "消耗金币进化宠物"},
+                {"cmd": "/放生宠物 @群友/QQ", "desc": "放生宠物（返还30%身价）"},
+                {"cmd": "/赎身", "desc": "🎉 宠物赎身获得自由（24小时保护期）"},
+                {"cmd": "/打工", "desc": "派遣所有宠物打工赚钱"},
+                {"cmd": "/训练 @群友/QQ", "desc": "训练单只宠物提升身价（冷却1天）"},
+                {"cmd": "/一键训练", "desc": "📚 批量训练所有宠物"},
+                {"cmd": "/进化宠物 @群友/QQ", "desc": "消耗金币进化宠物阶段"},
                 {"cmd": "/PK @群友/QQ", "desc": "⚔️ 宠物决斗（赢家掠夺10%身价）"},
                 {"cmd": "/我的宠物", "desc": "查看自己的宠物与金币"},
                 {"cmd": "/银行信息", "desc": "查看银行等级与利息"},
@@ -475,6 +477,22 @@ class Main(Star):
                 user_data = self._get_user_data(group_id, user_id)
                 target_data = self._get_user_data(group_id, target_id)
 
+                # 检查是否为宠物尝试购买主人
+                buyer_master = user_data.get("master", "")
+                if buyer_master and target_id == buyer_master:
+                    yield event.plain_result("❌ 你不能购买自己的主人！")
+                    return
+
+                # 检查目标是否在保护期（赎身后24小时）
+                protection_until = target_data.get("protection_until", 0)
+                if int(time.time()) < protection_until:
+                    remain = protection_until - int(time.time())
+                    hours = remain // 3600
+                    mins = (remain % 3600) // 60
+                    target_name = target_data.get("nickname") or await self._fetch_nickname(event, target_id)
+                    yield event.plain_result(f"❌ {target_name} 正处于保护期，{hours}小时{mins}分钟后才能被购买。")
+                    return
+
                 # 检查冷却
                 cooldown_seconds = self.config.get("purchase_cooldown", 3600)
                 in_cooldown, remain = self._check_cooldown(user_data, "purchase", cooldown_seconds)
@@ -568,13 +586,32 @@ class Main(Star):
                 yield event.plain_result("❌ 该宠物不在你的列表中。")
                 return
 
-            user_data["pets"].remove(target_id)
+            # 检查冷却
+            cooldown_seconds = self.config.get("release_cooldown", 3600)
+            in_cooldown, remain = self._check_cooldown(user_data, "release", cooldown_seconds)
+            if in_cooldown:
+                mins = remain // 60
+                yield event.plain_result(f"⏰ 放生冷却中，剩余 {mins} 分钟。")
+                return
+
             target_data = self._get_user_data(group_id, target_id)
+            target_name = target_data.get("nickname") or await self._fetch_nickname(event, target_id)
+            pet_value = target_data.get("value", 100)
+            
+            # 返还30%价值给主人
+            refund = int(pet_value * 0.3)
+            user_data["coins"] = user_data.get("coins", 0) + refund
+            
+            user_data["pets"].remove(target_id)
             target_data["master"] = ""
+            self._set_cooldown(user_data, "release")
             self._save_user_data(group_id, user_id, user_data)
             self._save_user_data(group_id, target_id, target_data)
-            target_name = target_data.get("nickname") or await self._fetch_nickname(event, target_id)
-            yield event.plain_result(f"🕊️ 成功放生宠物 {target_name}。")
+            yield event.plain_result(
+                f"🕊️ 成功放生宠物 {target_name}！\n"
+                f"💰 返还 {refund} 金币（身价30%）\n"
+                f"💵 当前余额：{user_data['coins']} 金币"
+            )
 
     # ==================== 命令：打工 ====================
     @filter.command("打工")
@@ -716,6 +753,151 @@ class Main(Star):
                     ])).format(name=name, decrease=decrease, value=pet["value"])
                     yield event.plain_result(f"❌ {msg}\n⭐ 当前阶段：{pet['evolution_stage']}")
 
+    # ==================== 命令：赎身 ====================
+    @filter.command("赎身")
+    async def ransom(self, event: AstrMessageEvent):
+        """宠物赎身"""
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+
+       # 检查监狱状态
+        jailed, remain = self._check_jailed(group_id, user_id)
+        if jailed:
+            hours = remain // 3600
+            mins = (remain % 3600) // 60
+            yield event.plain_result(f"🔒 你还在监狱中，剩余 {hours}小时{mins}分钟。")
+            return
+
+        async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{user_id}"):
+            user_data = self._get_user_data(group_id, user_id)
+            master_id = user_data.get("master", "")
+            
+            if not master_id:
+                yield event.plain_result("❌ 你是自由之身，无需赎身。")
+                return
+
+            pet_value = user_data.get("value", 100)
+            if user_data.get("coins", 0) < pet_value:
+                yield event.plain_result(f"❌ 金币不足，赎身需要 {pet_value} 金币（你的身价）。")
+                return
+
+            # 扣除金币，支付给主人
+            user_data["coins"] -= pet_value
+            master_data = self._get_user_data(group_id, master_id)
+            master_data["coins"] = master_data.get("coins", 0) + pet_value
+            if user_id in master_data.get("pets", []):
+                master_data["pets"].remove(user_id)
+
+            # 解除主从关系
+            user_data["master"] = ""
+            
+            # 设置保护期（24小时）
+            protection_hours = self.config.get("ransom_protection_hours", 24)
+            user_data["protection_until"] = int(time.time()) + (protection_hours * 3600)
+
+            self._save_user_data(group_id, user_id, user_data)
+            self._save_user_data(group_id, master_id, master_data)
+
+            user_name = user_data.get("nickname") or await self._fetch_nickname(event, user_id)
+            master_name = master_data.get("nickname") or await self._fetch_nickname(event, master_id)
+            
+            yield event.plain_result(
+                f"🎉 赎身成功！{user_name} 重获自由！\n"
+                f"💰 支付 {pet_value} 金币给 {master_name}\n"
+                f"🛡️ 获得 {protection_hours} 小时保护期\n"
+                f"💵 当前余额：{user_data['coins']} 金币"
+            )
+
+    # ==================== 命令：一键训练 ====================
+    @filter.command("一键训练", alias={"批量训练"})
+    async def batch_train(self, event: AstrMessageEvent):
+        """一键训练所有宠物"""
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+
+        # 检查监狱状态
+        jailed, remain = self._check_jailed(group_id, user_id)
+        if jailed:
+            hours = remain // 3600
+            mins = (remain % 3600) // 60
+            yield event.plain_result(f"🔒 你还在监狱中，剩余 {hours}小时{mins}分钟。")
+            return
+
+        async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{user_id}"):
+            user_data = self._get_user_data(group_id, user_id)
+            pets = user_data.get("pets", [])
+            
+            if not pets:
+                yield event.plain_result("❌ 你还没有宠物，无法训练。")
+                return
+
+            # 统计数据
+            total_cost = 0
+            success_count = 0
+            fail_count = 0
+            cooldown_count = 0
+            results = []
+
+            for pet_id in pets:
+                pet = self._get_user_data(group_id, pet_id)
+                cooldown_seconds = self.config.get("train_cooldown", 86400)
+                in_cooldown, _ = self._check_cooldown(pet, "train", cooldown_seconds)
+                
+                if in_cooldown:
+                    cooldown_count += 1
+                    continue
+
+                cost = int(pet["value"] * self.config.get("train_cost_rate", 0.1))
+                if user_data.get("coins", 0) < cost:
+                    # 金币不足，停止训练
+                    break
+
+                user_data["coins"] -= cost
+                total_cost += cost
+                
+                # 获取进化加成
+                stage = pet.get("evolution_stage", "普通")
+                _, train_bonus = self._get_evolution_bonuses(stage)
+                success_rate = self.config.get("train_success_rate", 0.7) + train_bonus
+
+                name = pet.get("nickname") or await self._fetch_nickname(event, pet_id)
+                
+                if random.random() < success_rate:
+                    # 训练成功
+                    base_increase = random.randint(15, 35)
+                    rate_increase = int(pet["value"] * 0.1)
+                    increase = base_increase + rate_increase
+                    pet["value"] += increase
+                    pet["evolution_stage"] = self._get_evolution_stage(pet["value"])
+                    self._set_cooldown(pet, "train")
+                    self._save_user_data(group_id, pet_id, pet)
+                    success_count += 1
+                    results.append(f"✅ {name}: +{increase} ({pet['value']})")
+                else:
+                    # 训练失败
+                    decrease = random.randint(10, 25)
+                    pet["value"] = max(100, pet["value"] - decrease)
+                    pet["evolution_stage"] = self._get_evolution_stage(pet["value"])
+                    self._set_cooldown(pet, "train")
+                    self._save_user_data(group_id, pet_id, pet)
+                    fail_count += 1
+                    results.append(f"❌ {name}: -{decrease} ({pet['value']})")
+
+            self._save_user_data(group_id, user_id, user_data)
+
+            # 输出结果
+            summary = f"【📚 批量训练报告】\n"
+            summary += f"成功：{success_count} | 失败：{fail_count} | 冷却：{cooldown_count}\n"
+            summary += f"💰 总消耗：{total_cost} 金币\n"
+            summary += f"💵 当前余额：{user_data['coins']} 金币\n\n"
+            summary += "\n".join(results[:10])  # 只显示前10条
+            
+            if len(results) > 10:
+                summary += f"\n... 还有 {len(results) - 10} 只宠物"
+            
+            yield event.plain_result(summary)
+
+
     # ==================== 命令：进化宠物 ====================
     @filter.command("进化宠物")
     async def evolve_pet(self, event: AstrMessageEvent):
@@ -766,10 +948,10 @@ class Main(Star):
                     if pet_value < 5000:
                         yield event.plain_result(f"❌ {name} 身价不足5000，无法进化到传说阶段。")
                         return
-                    yield event.plain_result(f"❌ {name} 已经是传说阶段，无法继续进化。")
-                    return
-                else:
-                    yield event.plain_result(f"❌ {name} 已经是最高阶段。")
+                    next_stage = "传说"
+                    cost = 5000  # 传说进化消耗
+                elif current_stage == "传说":
+                    yield event.plain_result(f"🌟 {name} 已是传说阶段，无法继续进化！")
                     return
 
                 # 检查金币
