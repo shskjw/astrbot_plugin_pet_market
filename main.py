@@ -7,20 +7,25 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from astrbot.api import star, logger
-from astrbot.api.star import Star, Context
+from astrbot.api.star import Star, Context, StarTools
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import At
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.session_lock import session_lock_manager
+from concurrent.futures import ThreadPoolExecutor
 
 # ==================== 常量定义 ====================
 PLUGIN_DIR = os.path.dirname(__file__)
-DATA_DIR = os.path.join("data", "pet_market")
-DATA_FILE = os.path.join(DATA_DIR, "pet_data.yml")
+# 数据目录将在 __init__ 中使用 StarTools 初始化
+DATA_DIR = None  # 延迟初始化
+DATA_FILE = None  # 延迟初始化
 COPYWRITING_FILE = os.path.join(PLUGIN_DIR, "resources", "data", "pet_copywriting.json")
 TRAIN_COPYWRITING_FILE = os.path.join(PLUGIN_DIR, "resources", "data", "train_copywriting.json")
 CARD_TEMPLATE = os.path.join(PLUGIN_DIR, "card_template.html")
 MENU_TEMPLATE = os.path.join(PLUGIN_DIR, "menu_template.html")
+
+# 线程池用于异步文件操作
+_executor = ThreadPoolExecutor(max_workers=1)
 
 # 默认初始金币
 INITIAL_COINS = 150
@@ -50,6 +55,12 @@ class Main(Star):
         self.train_copywriting: Dict = {}
         self._dirty = False  # 脏数据标记
         self._save_task: Optional[asyncio.Task] = None
+        
+        # 使用 StarTools 获取规范的数据目录
+        global DATA_DIR, DATA_FILE
+        DATA_DIR = StarTools.get_data_dir()
+        DATA_FILE = DATA_DIR / "pet_data.yml"
+        
         self._init_env()
         self._load_data()
         self._load_copywriting()
@@ -77,12 +88,12 @@ class Main(Star):
         logger.info("[宠物市场] 插件已关闭")
 
     async def _auto_save_loop(self):
-        """自动保存循环（每60秒）"""
+        """自动保存循环（每60秒，异步执行避免阻塞）"""
         try:
             while True:
                 await asyncio.sleep(60)
                 if self._dirty:
-                    self._save_data()
+                    await self._save_data_async()
                     self._dirty = False
                     logger.debug("[宠物市场] 自动保存完成")
         except asyncio.CancelledError:
@@ -108,11 +119,27 @@ class Main(Star):
             self.pet_data = {}
 
     def _save_data(self):
-        """保存数据到文件"""
+        """保存数据到文件（同步版本，供异步调用）"""
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 yaml.dump(self.pet_data, f, allow_unicode=True)
             logger.debug("[宠物市场] 数据保存成功")
+        except Exception as e:
+            logger.error(f"[宠物市场] 数据保存失败: {e}")
+
+    async def _save_data_async(self):
+        """异步保存数据（使用线程池避免阻塞）"""
+        loop = asyncio.get_event_loop()
+        # 创建数据副本避免并发问题
+        data_copy = dict(self.pet_data)
+        await loop.run_in_executor(_executor, self._write_data_file, data_copy)
+
+    def _write_data_file(self, data: Dict):
+        """写入数据文件（在线程池中执行）"""
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True)
+            logger.debug("[宠物市场] 数据异步保存成功")
         except Exception as e:
             logger.error(f"[宠物市场] 数据保存失败: {e}")
 
@@ -217,13 +244,17 @@ class Main(Star):
         cooldowns[cooldown_type] = int(time.time())
 
     def _extract_target(self, event: AstrMessageEvent) -> Optional[str]:
-        """提取目标用户ID"""
+        """提取目标用户ID（优先使用@，避免歧义）"""
+        # 优先从 At 组件提取（推荐方式）
         for comp in event.message_obj.message:
             if isinstance(comp, At):
                 return str(comp.qq)
-        # 从文字提取QQ号
+        
+        # 从文字提取QQ号（仅在没有@时使用）
+        # 注意：为避免与金额等数字混淆，仅匹配消息末尾的QQ号
         import re
-        match = re.search(r"(\d{5,})", event.message_str)
+        # 匹配消息末尾的5-11位数字（QQ号范围）
+        match = re.search(r'(\d{5,11})\s*$', event.message_str)
         return match.group(1) if match else None
 
     async def _fetch_nickname(self, event: AstrMessageEvent, user_id: str) -> str:

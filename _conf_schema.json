@@ -4,12 +4,9 @@
     "items": {
       "type": "string"
     },
-    "description": "管理员QQ号列表",
-    "default": [
-      "846994183",
-      "3864670906"
-    ],
-    "hint": "拥有特殊权限的QQ号"
+    "description": "管理员QQ号列表（请填写你的QQ号）",
+    "default": [],
+    "hint": "拥有特殊权限的QQ号，请自行配置"
   },
   "purchase_cooldown": {
     "type": "int",
