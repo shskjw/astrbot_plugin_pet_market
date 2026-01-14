@@ -181,11 +181,16 @@ class Main(Star):
             if "loan_amount" not in user:
                 user["loan_amount"] = 0
             if "loan_principal" not in user:
-                user["loan_principal"] = user.get("loan_amount", 0)  # 默认为当前欠款
+                user["loan_principal"] = user.get("loan_amount", 0)
             if "loan_interest_frozen" not in user:
                 user["loan_interest_frozen"] = False
             if "last_loan_interest_time" not in user:
                 user["last_loan_interest_time"] = int(time.time())
+            # 【新增】抢劫失败相关数据
+            if "rob_fail_streak" not in user:
+                user["rob_fail_streak"] = 0
+            if "rob_pending_penalty" not in user:
+                user["rob_pending_penalty"] = None
 
         if user_id not in group_data:
             group_data[user_id] = {
@@ -207,6 +212,10 @@ class Main(Star):
                 "initialized": True,
                 "transfer_history": [],
                 "evolution_stage": "普通"
+                # 【新增】抢劫相关
+                                   "rob_fail_streak": 0,  # 连败次数
+            "rob_pending_penalty": None  # 待处理的罚款状态
+
             }
             self._dirty = True
             logger.info(f"[宠物市场] 新用户 {user_id} 初始化，发放 {INITIAL_COINS} 金币")
@@ -389,6 +398,7 @@ class Main(Star):
         final_amount = principal * ((1 + rate) ** hours)
         interest = int(final_amount - principal)
         return interest
+
     # --- 贷款辅助方法与强制清算逻辑 ---
     def _update_loan_interest(self, user_data: Dict) -> int:
         """更新用户的贷款利息（带封顶逻辑）"""
@@ -565,6 +575,7 @@ class Main(Star):
                 {"cmd": "/放生宠物 @群友/QQ", "desc": "放生宠物（返还30%身价）"},
                 {"cmd": "/赎身", "desc": "🎉 宠物赎身获得自由（24小时保护期）"},
                 {"cmd": "/打工", "desc": "派遣所有宠物打工赚钱"},
+                {"cmd": "/逃跑", "desc": "尝试逃离主人(30%成功)"},
                 {"cmd": "/训练 @群友/QQ", "desc": "训练单只宠物提升身价（冷却1天）"},
                 {"cmd": "/一键训练", "desc": "📚 批量训练所有宠物"},
                 {"cmd": "/进化宠物 @群友/QQ", "desc": "消耗金币进化宠物阶段"},
@@ -583,6 +594,8 @@ class Main(Star):
                 {"cmd": "/宠物资金排行榜 [页码]", "desc": "查看余额排行（支持分页）"},
                 {"cmd": "/群内十大首富 [页码]", "desc": "查看总资产排行（支持分页）"},
                 {"cmd": "/抢劫 @群友/QQ", "desc": "每小时可抢劫一次"},
+                {"cmd": "/交罚款", "desc": "抢劫失败后缴纳罚款"},
+                {"cmd": "/坐牢", "desc": "抢劫失败后选择坐牢"},
             ]
         }
         try:
@@ -811,11 +824,9 @@ class Main(Star):
     # ==================== 命令：打工 ====================
     @filter.command("打工")
     async def work(self, event: AstrMessageEvent):
-        """派遣宠物打工"""
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
 
-        # 检查监狱状态
         jailed, remain = self._check_jailed(group_id, user_id)
         if jailed:
             hours = remain // 3600
@@ -863,11 +874,99 @@ class Main(Star):
                         lines.append(f"[{stage}] {name}：{copywriting} -{loss}")
                         self._save_user_data(group_id, pid, pet)
 
-            user_data["coins"] = user_data.get("coins", 0) + total
+            # 【新增】打工纳税逻辑
+            master_id = user_data.get("master", "")
+            tax_rate = self.config.get("work_tax_rate", 0.3)
+
+            if master_id and total > 0:
+                tax = int(total * tax_rate)
+                net_income = total - tax
+
+                # 给主人加钱
+                master_data = self._get_user_data(group_id, master_id)
+                master_data["coins"] = master_data.get("coins", 0) + tax
+                self._save_user_data(group_id, master_id, master_data)
+
+                master_name = master_data.get("nickname") or await self._fetch_nickname(event, master_id)
+
+                user_data["coins"] = user_data.get("coins", 0) + net_income
+                lines.append(f"\n💸 上交主人({master_name}) {int(tax_rate * 100)}%：{tax} 金币")
+                lines.append(f"💰 实得收入：{net_income} 金币")
+            else:
+                user_data["coins"] = user_data.get("coins", 0) + total
+                lines.append(f"\n💰 总计获得 {total} 金币")
+
             self._set_cooldown(user_data, "work")
             self._save_user_data(group_id, user_id, user_data)
-            lines.append(f"\n💰 总计获得 {total} 金币，当前余额 {user_data['coins']} 金币。")
+
+            lines.append(f"💵 当前余额：{user_data['coins']} 金币")
             yield event.plain_result("\n".join(lines))
+
+    # ==================== 【新增】命令：逃跑 ====================
+    @filter.command("逃跑")
+    async def escape(self, event: AstrMessageEvent):
+        """宠物尝试逃跑"""
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+
+        jailed, remain = self._check_jailed(group_id, user_id)
+        if jailed:
+            yield event.plain_result(f"🔒 你还在监狱中，没法越狱。")
+            return
+
+        async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{user_id}"):
+            user_data = self._get_user_data(group_id, user_id)
+            master_id = user_data.get("master", "")
+
+            if not master_id:
+                yield event.plain_result("❌ 你是自由之身，无需逃跑。")
+                return
+
+            # 检查冷却 (共用赎身冷却或单独设置，这里简单复用赎身逻辑相关的保护期概念，或者给逃跑单独加个冷却防止刷屏)
+            # 这里简单起见，使用 work_cooldown 防止无限刷
+            cooldown_seconds = 300
+            in_cooldown, remain = self._check_cooldown(user_data, "escape", cooldown_seconds)
+            if in_cooldown:
+                yield event.plain_result(f"🏃 刚跑累了，休息 {remain} 秒后再试。")
+                return
+            self._set_cooldown(user_data, "escape")
+
+            success_rate = self.config.get("escape_success_rate", 0.3)
+
+            if random.random() < success_rate:
+                # 成功
+                user_data["master"] = ""
+                # 从主人列表移除
+                master_data = self._get_user_data(group_id, master_id)
+                if user_id in master_data.get("pets", []):
+                    master_data["pets"].remove(user_id)
+                self._save_user_data(group_id, master_id, master_data)
+
+                # 保护期
+                protection_hours = self.config.get("ransom_protection_hours", 24)
+                user_data["protection_until"] = int(time.time()) + (protection_hours * 3600)
+
+                self._save_user_data(group_id, user_id, user_data)
+                yield event.plain_result(f"🎉 逃跑成功！你重获自由，并获得 {protection_hours} 小时保护期！")
+            else:
+                # 失败：负债翻倍
+                # 如果没有负债，则增加一笔等同于身价的负债作为惩罚
+                current_loan = user_data.get("loan_amount", 0)
+                penalty = 0
+                if current_loan > 0:
+                    penalty = current_loan  # 翻倍即再加一倍
+                    user_data["loan_amount"] += penalty
+                    user_data["loan_principal"] += penalty
+                else:
+                    # 无债逃跑失败，背负身价债务
+                    pet_value = user_data.get("value", 100)
+                    penalty = pet_value
+                    user_data["loan_amount"] = penalty
+                    user_data["loan_principal"] = penalty
+
+                self._save_user_data(group_id, user_id, user_data)
+                yield event.plain_result(
+                    f"💔 逃跑失败！被抓回来了...\n📉 惩罚：负债增加 {penalty} 金币！\n💸 当前欠款：{user_data['loan_amount']}")
 
     # ==================== 命令：训练 ====================
     @filter.command("训练")
@@ -1967,7 +2066,6 @@ class Main(Star):
     # ==================== 命令：抢劫 ====================
     @filter.command("抢劫")
     async def rob(self, event: AstrMessageEvent):
-        """抢劫其他玩家"""
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
         target_id = self._extract_target(event)
@@ -1980,7 +2078,6 @@ class Main(Star):
             yield event.plain_result("❌ 不能抢劫自己。")
             return
 
-        # 检查监狱状态
         jailed, remain = self._check_jailed(group_id, user_id)
         if jailed:
             hours = remain // 3600
@@ -1988,14 +2085,13 @@ class Main(Star):
             yield event.plain_result(f"🔒 你还在监狱中，剩余 {hours}小时{mins}分钟。")
             return
 
-        # 使用交易锁
         lock_ids = sorted([user_id, target_id])
         async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{lock_ids[0]}"):
             async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{lock_ids[1]}"):
                 user_data = self._get_user_data(group_id, user_id)
                 target_data = self._get_user_data(group_id, target_id)
 
-                # 检查冷却（使用配置）
+                # 检查冷却
                 cooldown_seconds = self.config.get("rob_cooldown", 3600)
                 in_cooldown, remain = self._check_cooldown(user_data, "rob", cooldown_seconds)
                 if in_cooldown:
@@ -2003,13 +2099,34 @@ class Main(Star):
                     yield event.plain_result(f"⏰ 抢劫冷却中，剩余 {mins} 分钟。")
                     return
 
+                # ==================== 新增：待处理案件超时逻辑 ====================
+                pending_penalty = user_data.get("rob_pending_penalty")
+                if pending_penalty:
+                    TIMEOUT_SECONDS = 3600  # 设置超时时间为 1 小时
+
+                    penalty_time = pending_penalty.get("time", 0)
+                    if int(time.time()) - penalty_time > TIMEOUT_SECONDS:
+                        # 案件已超时，强制坐牢
+                        jail_hours = self.config.get("rob_jail_hours", 24)
+                        user_data["jailed_until"] = int(time.time()) + (jail_hours * 3600)
+                        user_data["rob_pending_penalty"] = None  # 清除状态
+                        user_data["rob_fail_streak"] = 0  # 坐牢后重置连败
+                        self._save_user_data(group_id, user_id, user_data)
+                        yield event.plain_result(
+                            f"⏰ 你因超过1小时未处理抢劫案件，已被系统强制送入监狱 {jail_hours} 小时！")
+                        return  # 终止后续操作
+                    else:
+                        # 案件未超时，提醒玩家
+                        yield event.plain_result("🔒 你还有未处理的抢劫案件！请先选择 /交罚款 或 /坐牢。")
+                        return
+                # ==================== 修改结束 ====================
+
                 if target_data.get("coins", 0) == 0:
                     yield event.plain_result("❌ 目标余额为0，无法抢劫。")
                     return
 
                 self._set_cooldown(user_data, "rob")
 
-                # 计算成功率（基于银行等级）
                 attacker_level = user_data.get("bank_level", 1)
                 target_level = target_data.get("bank_level", 1)
                 success_rate = self._calculate_rob_success_rate(attacker_level, target_level)
@@ -2023,6 +2140,10 @@ class Main(Star):
                     amount = int(target_data["coins"] * rate)
                     target_data["coins"] -= amount
                     user_data["coins"] = user_data.get("coins", 0) + amount
+
+                    # 成功后重置连败
+                    user_data["rob_fail_streak"] = 0
+
                     self._save_user_data(group_id, user_id, user_data)
                     self._save_user_data(group_id, target_id, target_data)
 
@@ -2032,19 +2153,73 @@ class Main(Star):
                         f"💵 当前余额：{user_data['coins']} 金币"
                     )
                 else:
-                    # 抢劫失败，进监狱
-                    penalty = int(user_data.get("coins", 0) * 0.1)
-                    user_data["coins"] = max(0, user_data["coins"] - penalty)
-                    user_data["jailed_until"] = int(time.time()) + 86400  # 禁言1天
+                    # 抢劫失败：计算罚款并暂存状态
+                    user_value = user_data.get("value", 100)  # 身价
+                    streak = user_data.get("rob_fail_streak", 0)
+                    multiplier = 1.5 + (streak * 0.5)
+                    fine = int(user_value * multiplier)
+
+                    # 记录待处理状态
+                    user_data["rob_pending_penalty"] = {
+                        "amount": fine,
+                        "time": int(time.time())
+                    }
                     self._save_user_data(group_id, user_id, user_data)
 
                     yield event.plain_result(
-                        f"🚨 抢劫失败！{user_name} 被送入监狱！\n"
-                        f"💸 扣除 {penalty} 金币作为罚款\n"
-                        f"🔒 24小时内无法使用任何指令\n"
-                        f"🎲 成功率：{int(success_rate * 100)}%\n"
-                        f"💵 当前余额：{user_data['coins']} 金币"
+                        f"🚨 抢劫失败！{user_name} 被当场抓获！\n"
+                        f"⚖️ 当前连败次数：{streak} (罚款倍率 {multiplier}x)\n"
+                        f"💸 罚款金额：{fine} 金币 (按身价计算)\n"
+                        f"⚠️ 请在以下选项中二选一：\n"
+                        f"1. 发送 /交罚款 (扣除金币，保留自由)\n"
+                        f"2. 发送 /坐牢 (无需罚款，监禁24小时)"
                     )
+
+    # ==================== 命令：交罚款 ====================
+    @filter.command("交罚款")
+    async def pay_rob_fine(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+
+        async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{user_id}"):
+            user_data = self._get_user_data(group_id, user_id)
+            pending = user_data.get("rob_pending_penalty")
+
+            if not pending:
+                yield event.plain_result("❓ 你当前没有待处理的抢劫案件。")
+                return
+
+            fine = pending["amount"]
+            if user_data.get("coins", 0) < fine:
+                yield event.plain_result(f"❌ 余额不足！需要 {fine} 金币。请充值或选择 /坐牢。")
+                return
+
+            user_data["coins"] -= fine
+            user_data["rob_pending_penalty"] = None  # 清除状态
+            user_data["rob_fail_streak"] += 1  # 增加连败次数，下次更贵
+
+            self._save_user_data(group_id, user_id, user_data)
+            yield event.plain_result(f"💸 罚款缴纳成功！扣除 {fine} 金币。下次抢劫失败罚款倍率将提升。")
+
+    # ==================== 命令：坐牢 ====================
+    @filter.command("坐牢")
+    async def go_to_jail(self, event: AstrMessageEvent):
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+
+        async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{user_id}"):
+            user_data = self._get_user_data(group_id, user_id)
+            if not user_data.get("rob_pending_penalty"):
+                yield event.plain_result("❓ 你当前没有待处理的抢劫案件。")
+                return
+
+            jail_hours = self.config.get("rob_jail_hours", 24)
+            user_data["jailed_until"] = int(time.time()) + (jail_hours * 3600)
+            user_data["rob_pending_penalty"] = None  # 清除状态
+            user_data["rob_fail_streak"] = 0  # 坐牢后重置连败计数
+
+            self._save_user_data(group_id, user_id, user_data)
+            yield event.plain_result(f"⛓️ 你选择了坐牢。将在监狱中度过 {jail_hours} 小时。")
 
     # ==================== 管理员命令 ====================
     def _is_admin(self, user_id: str) -> bool:
