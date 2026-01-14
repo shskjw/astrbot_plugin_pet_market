@@ -211,10 +211,10 @@ class Main(Star):
                 "last_active": int(time.time()),
                 "initialized": True,
                 "transfer_history": [],
-                "evolution_stage": "普通"
+                "evolution_stage": "普通",
                 # 【新增】抢劫相关
-                                   "rob_fail_streak": 0,  # 连败次数
-            "rob_pending_penalty": None  # 待处理的罚款状态
+                "rob_fail_streak": 0,  # 连败次数
+                "rob_pending_penalty": None  # 待处理的罚款状态
 
             }
             self._dirty = True
