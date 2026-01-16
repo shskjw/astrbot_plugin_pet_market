@@ -2737,39 +2737,54 @@ class Main(Star):
         【新增】初始化管理员列表
         从配置中获取管理员ID，支持多种配置方式
         """
-        admins = []
-        
+        admins = set()
+
+        def parse_admins(value):
+            """辅助解析函数"""
+            result = set()
+            if isinstance(value, list):
+                for item in value:
+                    result.update(parse_admins(item))
+            elif isinstance(value, str):
+                # 支持逗号、分号、空格分隔
+                import re
+                parts = re.split(r'[,;，；\s]+', value)
+                for part in parts:
+                    s = part.strip()
+                    if s.isdigit():
+                        result.add(s)
+            elif isinstance(value, (int, float)):
+                result.add(str(int(value)))
+            return result
+
         # 方式1：从 config 中的 admin_uins 字段获取
-        admin_list = self.config.get("admin_uins", [])
-        if admin_list:
-            for admin_id in admin_list:
-                admin_str = str(admin_id).strip()
-                if admin_str.isdigit():
-                    admins.append(admin_str)
-                    logger.debug(f"[宠物市场] 添加管理员: {admin_str} (来自 admin_uins)")
+        admin_conf = self.config.get("admin_uins", [])
+        admins.update(parse_admins(admin_conf))
         
-        # 方式2：从 context 的全局配置中获取 admins_id
+        # 方式2：尝试获取 admins_id (兼容其他配置方式)
         try:
+            # 尝试直接从 config 获取
+            if "admins_id" in self.config:
+                admins.update(parse_admins(self.config["admins_id"]))
+            
+            # 保留原有的 context.get_config 逻辑
             global_config = self.context.get_config()
             if global_config and isinstance(global_config, dict):
-                admins_id = global_config.get("admins_id", [])
-                if admins_id:
-                    for admin_id in admins_id:
-                        admin_str = str(admin_id).strip()
-                        if admin_str.isdigit() and admin_str not in admins:
-                            admins.append(admin_str)
-                            logger.debug(f"[宠物市场] 添加管理员: {admin_str} (来自 admins_id)")
+                if "admins_id" in global_config:
+                    admins.update(parse_admins(global_config["admins_id"]))
         except Exception as e:
             logger.warning(f"[宠物市场] 从全局配置获取管理员失败: {e}")
         
-        # 如果没有配置任何管理员，使用默认管理员
-        if not admins:
-            admins = ["846994183", "3864670906"]
-            logger.info(f"[宠物市场] 使用默认管理员列表: {admins}")
-        else:
-            logger.info(f"[宠物市场] 已加载 {len(admins)} 个管理员: {admins}")
+        final_list = list(admins)
         
-        return admins
+        # 如果没有配置任何管理员，使用默认管理员
+        if not final_list:
+            final_list = ["846994183", "3864670906"]
+            logger.info(f"[宠物市场] 使用默认管理员列表: {final_list}")
+        else:
+            logger.info(f"[宠物市场] 已加载 {len(final_list)} 个管理员: {final_list}")
+        
+        return final_list
 
     def _is_admin(self, user_id: str) -> bool:
         """检查是否是管理员"""
