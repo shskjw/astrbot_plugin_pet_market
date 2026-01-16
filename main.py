@@ -52,9 +52,9 @@ EVOLUTION_COSTS = {
 
 # ==================== 商店物品定义 ====================
 SHOP_ITEMS = {
-    "101": {"name": "精力药水", "price": 500, "desc": "立即清除打工和训练的冷却时间", "icon": "🧪"},
-    "102": {"name": "护身符", "price": 2000, "desc": "自动抵挡一次抢劫（生效后消耗）", "icon": "🧿"},
-    "104": {"name": "初级刮刮乐", "price": 200, "desc": "小赌怡情，最高奖 2000 金币", "icon": "🎫",
+    "101": {"name": "精力药水", "price": 500, "desc": "【每日必备】立即重置打工和训练冷却，肝帝首选", "icon": "🧪"},
+    "102": {"name": "护身符", "price": 2000, "desc": "【保财神器】自动抵挡一次抢劫，生效后消耗", "icon": "🧿"},
+    "104": {"name": "初级刮刮乐", "price": 200, "desc": "【小赌怡情】最高赢 2000 金币 (10倍)，回本率 55%", "icon": "🎫",
             "type": "scratch_card", 
             "awards": [
                 {"name": "谢谢惠顾", "prob": 0.45, "amount": 0},
@@ -65,8 +65,8 @@ SHOP_ITEMS = {
                 {"name": "手气爆棚", "prob": 0.018, "amount": 1000},
                 {"name": "天选之子", "prob": 0.002, "amount": 2000},
             ]},
-    "105": {"name": "宠物零食", "price": 300, "desc": "给宠物喂食，随机增加 20-50 身价", "icon": "🦴"},
-    "106": {"name": "高级刮刮乐", "price": 1000, "desc": "玩的就是心跳，最高奖 10000 金币", "icon": "🎫",
+    "105": {"name": "宠物零食", "price": 300, "desc": "【养成必备】喂食增加 20-50 身价，提升PK胜率", "icon": "🦴"},
+    "106": {"name": "高级刮刮乐", "price": 1000, "desc": "【搏一搏】最高赢 10000 金币 (10倍)，有机会暴富", "icon": "🎫",
              "type": "scratch_card",
              "awards": [
                  {"name": "谢谢惠顾", "prob": 0.50, "amount": 0},
@@ -76,6 +76,9 @@ SHOP_ITEMS = {
                  {"name": "财神附体", "prob": 0.04, "amount": 3000},
                  {"name": "超级大奖", "prob": 0.01, "amount": 10000},
              ]},
+    "107": {"name": "基因药剂", "price": 2000, "desc": "【高风险】30%概率身价翻倍，70%概率身价减半", "icon": "💉"},
+    "108": {"name": "潘多拉魔盒", "price": 2000, "desc": "【极致心跳】8%赢10倍大奖，但也有大概率坐牢或破产", "icon": "📦"},
+    "109": {"name": "走私货物", "price": 5000, "desc": "【创业路】50%大赚数千金币，50%被没收且罚款", "icon": "💼"},
 }
 
 
@@ -3251,6 +3254,129 @@ class Main(Star):
                     pet_name = pet_data.get("nickname") or f"宠物{target_pet_id}"
                     self._save_user_data(group_id, target_pet_id, pet_data)
                     msg = f"🦴 给 {pet_name} 喂了 {count} 份零食，身价共增加 {total_increase}！"
+            
+            elif item_id == "107": # 基因药剂
+                pets = user.get("pets", [])
+                if not pets:
+                    msg = "❌ 你没有宠物可以改造。"
+                    consumed = False
+                else:
+                    target_pet_id = pets[0]
+                    pet_data = self._get_user_data(group_id, target_pet_id)
+                    old_value = pet_data.get("value", 100)
+                    pet_name = pet_data.get("nickname") or f"宠物{target_pet_id}"
+                    
+                    results = []
+                    success_count = 0
+                    fail_count = 0
+                    
+                    # 批量使用逻辑
+                    new_val_temp = old_value
+                    for _ in range(count):
+                         if random.random() < 0.3: # 30% 成功
+                             increase = int(new_val_temp * 1.0) # +100%
+                             new_val_temp += increase
+                             success_count += 1
+                         else: # 70% 失败
+                             decrease = int(new_val_temp * 0.5) # -50%
+                             new_val_temp -= decrease
+                             fail_count += 1
+                    
+                    new_val_temp = max(1, new_val_temp) # 最低保留1
+                    pet_data["value"] = new_val_temp
+                    self._save_user_data(group_id, target_pet_id, pet_data)
+                    
+                    change = new_val_temp - old_value
+                    icon = "📈" if change >= 0 else "📉"
+                    msg = (f"💉 对 {pet_name} 进行了 {count} 次基因改造...\n"
+                           f"✅ 成功翻倍: {success_count} 次\n"
+                           f"❌ 失败变异: {fail_count} 次\n"
+                           f"{icon} 身价变化: {old_value} -> {new_val_temp} ({change:+})")
+
+            elif item_id == "108": # 潘多拉魔盒
+                # 不支持批量太高风险，或者循环处理
+                logs = []
+                final_change = 0
+                
+                for i in range(count):
+                    r = random.random()
+                    effect_msg = ""
+                    if r < 0.08: # 8% 10倍大奖 (2000 -> 20000)
+                        prize = 20000
+                        user["coins"] += prize
+                        effect_msg = "🎆 触发传说级宝藏！获得 20,000 金币 (10倍)！"
+                        final_change += prize
+                    elif r < 0.30: # 22% 2倍小奖 (2000 -> 4000)
+                        prize = 4000
+                        user["coins"] += prize
+                        effect_msg = "🎉 运气不错！获得 4,000 金币！"
+                        final_change += prize
+                    elif r < 0.60: # 30% 坐牢
+                        jail_time = 4 * 3600 # 4小时
+                        user["jailed_until"] = max(user.get("jailed_until", 0), int(time.time())) + jail_time
+                        user["jailed_reason"] = "打开潘多拉魔盒释放了恶魔"
+                        effect_msg = "👮 盒子释放出恶魔，抓你坐牢 4 小时！"
+                    elif r < 0.80: # 20% 破产/失窃 (扣30%)
+                        loss = int(user["coins"] * 0.3)
+                        user["coins"] -= loss
+                        effect_msg = f"💸 盒子是个黑洞，吸走了你 30% 资金 (-{loss}币)！"
+                        final_change -= loss
+                    else: # 20% 空
+                        effect_msg = "💨 盒子里什么都没有，只有一阵嘲笑声..."
+                    
+                    if count == 1:
+                        msg = f"📦 打开潘多拉魔盒...\n{effect_msg}"
+                    else:
+                        logs.append(effect_msg)
+
+                self._save_user_data(group_id, user_id, user)
+                if count > 1:
+                   msg = f"📦 连续打开 {count} 个魔盒...\n" + "\n".join([f"{idx+1}. {l}" for idx, l in enumerate(logs)])
+                   msg += f"\n💰 总资金变动: {final_change:+}"
+
+            elif item_id == "109": # 走私货物
+                total_profit = 0
+                success_num = 0
+                fail_num = 0
+                
+                for _ in range(count):
+                    # 成本已在购买时扣除(5000)，这里只结算卖出
+                    # 售价期望：
+                    # 50% 卖出 8000-12000 (均10000) -> 赚5000
+                    # 50% 被抓 罚款 2000 -> 亏损购买成本5000+罚款2000 = -7000
+                    if random.random() < 0.5:
+                        sale_price = random.randint(8000, 12000)
+                        user["coins"] += sale_price
+                        total_profit += (sale_price) # 这里计算的是回款，算纯利不好算因为购买分离开了，只显示回款和罚款
+                        success_num += 1
+                    else:
+                        fine = 2000
+                        user["coins"] = max(0, user.get("coins", 0) - fine)
+                        total_profit -= fine # 负数代表扣款
+                        fail_num += 1
+                        
+                self._save_user_data(group_id, user_id, user)
+                
+                net_income = total_profit
+                cost = 5000 * count
+                pure_profit = net_income - cost # 算上购买成本的净利润（购买时已扣除，这里net_income是卖出得钱-罚款）
+                                                # 修正逻辑：total_profit在成功时加的是全额售价，失败时减的是额外罚款
+                                                # 所以 pure_profit = (卖出总回款 - 罚款总额) - 投入成本
+                
+                # 重新计算一下为了展示清晰
+                # 成功：获得 sale_price (包含回本)
+                # 失败：失去 fine (不包含回本，通过 buying cost 体现亏损)
+                
+                real_gain = 0
+                for _ in range(success_num): real_gain += 10000 # 估算显示
+                real_loss_fine = fail_num * 2000
+                
+                net_change_now = total_profit # 现在的金币变化（+卖出款 -罚款）
+
+                msg = (f"💼 进行了 {count} 次走私交易...\n"
+                       f"✅ 交易成功: {success_num} 次 (高价售出)\n"
+                       f"🚓 被捕没收: {fail_num} 次 (货物被缴且罚款)\n"
+                       f"💰 资金变动: {net_change_now:+} 金币 (不含进货成本)")
             
             else:
                 msg = "❌ 该道具无法主动使用。"
