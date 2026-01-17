@@ -265,6 +265,7 @@ class Main(Star):
 
         # 【新增】初始化管理员列表
         self.admins = self._init_admins()
+        self.debt_queue = [] # 追债队列
 
         self.market_manager = MarketManager(MARKET_FILE) # 初始化市场管理器
 
@@ -315,11 +316,76 @@ class Main(Star):
                 await asyncio.sleep(60)
         logger.info("[宠物市场] 插件已关闭")
 
+    async def _process_debt_queue(self):
+        """处理追债队列"""
+        if not self.debt_queue:
+            return
+
+        # 取出所有当前任务
+        tasks = self.debt_queue[:]
+        self.debt_queue = []
+
+        for task in tasks:
+            group_id = task["group_id"]
+            debtor_id = task["debtor_id"]
+            target_id = task["target_id"]
+            base_amount = task["amount"] # 原始转账金额限制
+
+            # 排序锁，防止死锁
+            lock_ids = sorted([debtor_id, target_id])
+            try:
+                async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{lock_ids[0]}"):
+                    async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{lock_ids[1]}"):
+                        debtor = self._get_user_data(group_id, debtor_id)
+                        target = self._get_user_data(group_id, target_id)
+                        
+                        debt = debtor.get("loan_amount", 0)
+                        if debt <= 0:
+                            continue # 已经还清了
+
+                        # 计算最多需要追回多少（不能超过债务，也不能超过当时的转账额）
+                        max_clawback = min(amount for amount in [base_amount, debt])
+                        
+                        # 1. 扣现金
+                        target_coins = target.get("coins", 0)
+                        deduct_coins = min(target_coins, max_clawback)
+                        
+                        target["coins"] -= deduct_coins
+                        debtor["loan_amount"] -= deduct_coins
+                        
+                        remaining_need = max_clawback - deduct_coins
+                        
+                        # 2. 扣存款
+                        deduct_bank = 0
+                        if remaining_need > 0:
+                             target_bank = target.get("bank", 0)
+                             deduct_bank = min(target_bank, remaining_need)
+                             if deduct_bank > 0:
+                                 target["bank"] -= deduct_bank
+                                 debtor["loan_amount"] -= deduct_bank
+                        
+                        total_deducted = deduct_coins + deduct_bank
+                        
+                        if total_deducted > 0:
+                             # 记录一些信息让用户知道
+                             target_name = task.get("target_name", target_id)
+                             logger.info(f"[{group_id}] 追债成功：从 {target_name}({target_id}) 追回 {total_deducted}")
+                             
+                             debtor["last_clawback_msg"] = f"成功从 {target_name} 处追回 {total_deducted} 金币抵债"
+                             target["last_clawback_msg"] = f"因 {debtor_id} 贷款逾期，银行强制收回了其向您转移的资金 {total_deducted} 金币"
+
+                             self._save_user_data(group_id, debtor_id, debtor)
+                             self._save_user_data(group_id, target_id, target)
+                             
+            except Exception as e:
+                logger.error(f"[追债] 处理任务失败 {task}: {e}")
+
     async def _auto_save_loop(self):
         """自动保存循环（每60秒，异步执行避免阻塞）"""
         try:
             while True:
                 await asyncio.sleep(60)
+                await self._process_debt_queue() # 处理追债
                 if self._dirty:
                     await self._save_data_async()
                     self._dirty = False
@@ -545,9 +611,15 @@ class Main(Star):
     def _extract_target(self, event: AstrMessageEvent) -> Optional[str]:
         """提取目标用户ID（优先使用@，避免歧义）"""
         # 优先从 At 组件提取（推荐方式）
+        at_targets = []
         for comp in event.message_obj.message:
             if isinstance(comp, At):
-                return str(comp.qq)
+                at_targets.append(str(comp.qq))
+        
+        if at_targets:
+            # 如果有多个 @，通常机器人的 @ 会在最前面（唤醒词），目标在后面
+            # 取最后一个能有效避免识别到机器人
+            return at_targets[-1]
 
         # 从文字提取QQ号（仅在没有@时使用）
         # 注意：为避免与金额等数字混淆，仅匹配消息末尾的QQ号
@@ -1003,6 +1075,26 @@ class Main(Star):
 
         # 5. 结算状态
         if user_data["loan_amount"] > 0:
+            # 【新增】追缴转账资金
+            suspicious_transfers = user_data.get("loan_transfers", [])
+            if suspicious_transfers:
+                clawback_count = 0
+                for record in suspicious_transfers:
+                    # 将追缴任务加入队列，由后台任务异步处理
+                    self.debt_queue.append({
+                        "group_id": group_id,
+                        "debtor_id": user_id,
+                        "target_id": record["target"],
+                        "amount": record["amount"],
+                        "target_name": record.get("target_name", record["target"])
+                    })
+                    clawback_count += 1
+                
+                # 清空记录防止重复追缴
+                user_data["loan_transfers"] = []
+                log_msg.append(f"🕵️ 发现 {clawback_count} 笔存续期间的转账记录。")
+                log_msg.append("⚖️ 银行已启动外部资金追回程序，将从收款人账户强制划扣！")
+
             # 依然资不抵债
             user_data["loan_interest_frozen"] = True
             log_msg.append(f"⚠️ 资产抵扣后仍欠款 {user_data['loan_amount']} 金币。")
@@ -2185,6 +2277,7 @@ class Main(Star):
                 user["loan_amount"] = 0
                 user["loan_principal"] = 0
                 user["loan_interest_frozen"] = False  # 解除冻结
+                user["loan_transfers"] = []  # 贷款还清，以前的转账记录既往不咎
 
             self._save_user_data(group_id, user_id, user)
 
@@ -2241,6 +2334,19 @@ class Main(Star):
             async with session_lock_manager.acquire_lock(f"pet_market_{group_id}_{lock_ids[1]}"):
                 user_data = self._get_user_data(group_id, user_id)
                 target_data = self._get_user_data(group_id, target_id)
+
+                # 检查贷款状态（记录带病转账）
+                loan_status_msg = ""
+                if user_data.get("loan_amount", 0) > 0:
+                    loan_status_msg = "\n⚠️ 注意：您当前处于负债状态！此笔转账已被银行记录。若您逾期未还款，银行有权追回此笔资金！"
+                    # 记录转账信息供追讨使用
+                    transfer_record = {
+                        "target": target_id,
+                        "amount": amount,
+                        "time": int(time.time()),
+                        "target_name": target_data.get("nickname", target_id) # 记录一下当时的昵称方便排查
+                    }
+                    user_data.setdefault("loan_transfers", []).append(transfer_record)
 
                 # 检查冷却（使用配置）
                 cooldown_seconds = self.config.get("transfer_cooldown", 1800)
@@ -2308,6 +2414,7 @@ class Main(Star):
                     f"💵 手续费：{fee} 金币 ({int(fee_rate * 100)}%)\n"
                     f"📊 你的余额：{user_data['coins']} 金币\n"
                     f"📊 对方余额：{target_data['coins']} 金币"
+                    f"{loan_status_msg}"
                 )
 
     # ==================== 命令：转账记录 ====================
@@ -3230,7 +3337,13 @@ class Main(Star):
                    consumed = False
                 else:
                     user["cooldowns"] = {}
-                    msg = "🧪 精力焕发！所有冷却时间已重置！"
+                    # 重置所有宠物的冷却
+                    for pet_id in user.get("pets", []):
+                        pet_data = self._get_user_data(group_id, pet_id)
+                        pet_data["cooldowns"] = {}
+                        self._save_user_data(group_id, pet_id, pet_data)
+
+                    msg = "🧪 精力焕发！所有冷却时间（含宠物训练）已重置！"
                 
             elif item_id == "102": # 护身符
                 msg = f"🧿 护身符无需主动使用，放在背包自动生效。(当前库存: {inventory.get(item_id)} 个)"
